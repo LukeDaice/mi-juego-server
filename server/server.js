@@ -110,12 +110,20 @@ const server = http.createServer((req, res) => {
     res.end('Not Found');
 });
 
-// Servidor WebSocket integrado
-const wss = new WebSocket.Server({ server });
+// Servidor WebSocket integrado (baja latencia para juegos en tiempo real)
+const wss = new WebSocket.Server({
+    server,
+    perMessageDeflate: false // Desactiva compresión innecesaria para evitar delay en paquetes pequeños
+});
 
 let nextPeerId = 2; // El Host siempre es el peer ID 1 en Godot
 
 wss.on('connection', (ws) => {
+    // Desactivar el algoritmo de Nagle en TCP para enviar paquetes de inmediato (sin buffer latency)
+    if (ws._socket && typeof ws._socket.setNoDelay === 'function') {
+        ws._socket.setNoDelay(true);
+    }
+
     ws.isAlive = true;
     ws.roomId = null;
     ws.peerId = null;
