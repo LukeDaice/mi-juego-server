@@ -33,6 +33,12 @@ const server = http.createServer((req, res) => {
         return;
     }
 
+    if (req.url === '/health' || req.url === '/healthz') {
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.end('ok');
+        return;
+    }
+
     if (req.url === '/api/rooms' || req.url === '/rooms') {
         const roomList = getPublicRoomsList();
         res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -165,11 +171,18 @@ function handleControlMessage(ws, msg) {
     const type = msg.type || msg.action;
 
     switch (type) {
+        case 'leave': {
+            // Salida explícita: el cliente avisa antes de cerrar (los proxies tardan ~10 s en propagar el cierre)
+            handleDisconnect(ws);
+            break;
+        }
+
         case 'create_room': {
+            if (ws.roomId) handleDisconnect(ws); // ya estaba en otra sala: salir primero
             const roomId = generateRoomCode();
             const roomName = (msg.room_name || 'Sala de Carreras').trim().substring(0, 40);
             const hostName = (msg.host_name || 'Anfitrión').trim().substring(0, 24);
-            const maxPlayers = Math.min(Math.max(parseInt(msg.max_players || 6), 2), 6);
+            const maxPlayers = Math.min(Math.max(parseInt(msg.max_players || 8), 2), 8);
 
             const room = {
                 id: roomId,
@@ -213,6 +226,11 @@ function handleControlMessage(ws, msg) {
         case 'join_room': {
             const roomId = (msg.room_id || msg.code || '').trim().toUpperCase();
             const clientName = (msg.player_name || 'Piloto').trim().substring(0, 24);
+
+            if (ws.roomId) {
+                if (ws.roomId === roomId) return; // join duplicado: ignorar
+                handleDisconnect(ws);
+            }
 
             const room = rooms.get(roomId);
             if (!room) {
@@ -290,19 +308,73 @@ function handleGamePacket(ws, packet) {
 
     room.lastHeartbeat = Date.now();
 
+    // Solo se pueden descartar paquetes "efímeros" (snapshot / car_state / input),
+    // porque llegará uno más nuevo enseguida. Los mensajes críticos (lobby, start_race,
+    // hit, event, join, return_to_lobby, torneo...) NUNCA se descartan: perderlos
+    // deja a los clientes desincronizados o atascados.
+    const droppable = isDroppablePacket(packet);
+
     if (ws.isHost) {
         // El host difunde snapshots o eventos a todos los clientes de su sala
         for (const [peerId, clientWs] of room.players) {
             if (peerId !== 1 && clientWs.readyState === WebSocket.OPEN) {
+                if (clientWs.bufferedAmount > MAX_BUFFERED_HARD) {
+                    // Cliente muerto/atascado: expulsarlo en vez de acumular memoria sin límite
+                    console.warn(`[!] Cliente ${peerId} atascado (${clientWs.bufferedAmount} B), cerrando`);
+                    clientWs.terminate();
+                    continue;
+                }
+                if (droppable && clientWs.bufferedAmount > MAX_BUFFERED_DROPPABLE) {
+                    continue;
+                }
                 clientWs.send(packet, { binary: true });
             }
         }
     } else {
         // Los clientes envían sus inputs únicamente al host
         if (room.hostWs && room.hostWs.readyState === WebSocket.OPEN) {
+            if (droppable && room.hostWs.bufferedAmount > MAX_BUFFERED_DROPPABLE) {
+                return;
+            }
             room.hostWs.send(packet, { binary: true });
         }
     }
+}
+
+const MAX_BUFFERED_DROPPABLE = 65536;     // 64 KB: a partir de aquí se descartan snapshots/inputs viejos
+const MAX_BUFFERED_HARD = 4 * 1024 * 1024; // 4 MB: la conexión se considera muerta
+const DROPPABLE_CMDS = new Set(['snapshot', 'car_state', 'input']);
+
+/**
+ * Lee el valor de la clave "cmd" de un Dictionary serializado con var_to_bytes() de Godot 4
+ * (formato: u32 tipo=27, u32 nº elementos, luego pares clave/valor; String = u32 tipo=4, u32 len, bytes con padding a 4).
+ * Devuelve null si el paquete no tiene ese formato (en ese caso se trata como crítico).
+ */
+function readGodotCmd(buf) {
+    try {
+        if (buf.length < 8) return null;
+        if ((buf.readUInt32LE(0) & 0xFFFF) !== 27) return null; // TYPE_DICTIONARY
+        let off = 8;
+        const readString = () => {
+            if ((buf.readUInt32LE(off) & 0xFFFF) !== 4) return null;
+            const len = buf.readUInt32LE(off + 4);
+            if (len > 64) return null;
+            const s = buf.toString('utf8', off + 8, off + 8 + len);
+            off += 8 + len + ((4 - (len % 4)) % 4);
+            return s;
+        };
+        if ((buf.readUInt32LE(off) & 0xFFFF) !== 4) return null;
+        if (readString() !== 'cmd') return null;
+        if ((buf.readUInt32LE(off) & 0xFFFF) !== 4) return null;
+        return readString();
+    } catch (e) {
+        return null;
+    }
+}
+
+function isDroppablePacket(packet) {
+    const cmd = readGodotCmd(packet);
+    return cmd !== null && DROPPABLE_CMDS.has(cmd);
 }
 
 /**
@@ -310,19 +382,22 @@ function handleGamePacket(ws, packet) {
  */
 function handleDisconnect(ws) {
     if (!ws.roomId) return;
-    const room = rooms.get(ws.roomId);
+    const roomId = ws.roomId;
+    ws.roomId = null; // idempotente: 'leave' + 'close' no deben procesarse dos veces
+    const room = rooms.get(roomId);
     if (!room) return;
 
     if (ws.isHost) {
-        console.log(`[-] El anfitrión cerró la sala "${room.roomName}" [ID: ${ws.roomId}]`);
+        console.log(`[-] El anfitrión cerró la sala "${room.roomName}" [ID: ${roomId}]`);
         // Avisar a todos los clientes que la sala se cerró
         for (const [peerId, clientWs] of room.players) {
             if (peerId !== 1 && clientWs.readyState === WebSocket.OPEN) {
+                clientWs.roomId = null;
                 clientWs.send(JSON.stringify({ type: 'host_disconnected', message: 'El anfitrión ha cerrado la sala.' }));
                 clientWs.close();
             }
         }
-        rooms.delete(ws.roomId);
+        rooms.delete(roomId);
     } else {
         console.log(`[-] Jugador "${ws.playerName || ws.peerId}" salió de la sala "${room.roomName}"`);
         room.players.delete(ws.peerId);
@@ -346,6 +421,11 @@ function getPublicRoomsList() {
     for (const [id, r] of rooms) {
         // Si una sala no ha tenido latidos en 30 segundos, considerarla inactiva
         if (now - r.lastHeartbeat > 30000) {
+            // Cerrar de verdad al host y clientes (antes quedaban "huérfanos" sin sala)
+            for (const [, pws] of r.players) {
+                pws.roomId = null;
+                try { pws.close(1001, 'Sala inactiva'); } catch (e) { /* ignorar */ }
+            }
             rooms.delete(id);
             continue;
         }
@@ -368,11 +448,14 @@ function getPublicRoomsList() {
  */
 function generateRoomCode() {
     const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-    let code = '';
-    for (let i = 0; i < 4; i++) {
-        code += chars.charAt(Math.floor(Math.random() * chars.length));
+    for (let attempt = 0; attempt < 50; attempt++) {
+        let code = '';
+        for (let i = 0; i < 4; i++) {
+            code += chars.charAt(Math.floor(Math.random() * chars.length));
+        }
+        if (!rooms.has(code)) return code; // evitar pisar una sala existente
     }
-    return code;
+    return Date.now().toString(36).toUpperCase().slice(-6); // último recurso
 }
 
 function escapeHtml(str) {
@@ -390,7 +473,7 @@ setInterval(() => {
         ws.isAlive = false;
         ws.ping();
     });
-}, 10000);
+}, 5000);
 
 // Iniciar servidor
 server.listen(PORT, () => {

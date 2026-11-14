@@ -35,9 +35,9 @@ Para que tus amigos puedan jugar contigo sin que tengas tu computadora encendida
    - **Plan**: `Free` ($0/mes)
 6. Haz clic en **Create Web Service**.
 7. Render te dará una URL segura como:
-   `https://mi-juego-carreras.onrender.com`
+   `https://mi-juego-server-aex7.onrender.com`
 8. En el juego, en la pestaña **EN LÍNEA**, introduces esa dirección en formato WebSocket:
-   `wss://mi-juego-carreras.onrender.com`
+   `wss://mi-juego-server-aex7.onrender.com`
 ¡Listo! Cualquier persona en el mundo podrá ver tus salas y unirse a tus carreras.
 
 ---
