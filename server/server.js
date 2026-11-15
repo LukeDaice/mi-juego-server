@@ -210,7 +210,8 @@ function handleControlMessage(ws, msg) {
                 room_id: roomId,
                 room_name: roomName,
                 host_name: hostName,
-                peer_id: 1
+                peer_id: 1,
+                epoch_ms: room.createdAt
             }));
             break;
         }
@@ -263,7 +264,8 @@ function handleControlMessage(ws, msg) {
                 room_id: roomId,
                 room_name: room.roomName,
                 host_name: room.hostName,
-                peer_id: assignedPeerId
+                peer_id: assignedPeerId,
+                epoch_ms: room.createdAt
             }));
 
             // Notificar al anfitrión
@@ -288,12 +290,41 @@ function handleControlMessage(ws, msg) {
         }
 
         case 'ping': {
+            let epochMs = Date.now();
             if (ws.roomId) {
                 const room = rooms.get(ws.roomId);
-                if (room) room.lastHeartbeat = Date.now();
+                if (room) {
+                    room.lastHeartbeat = Date.now();
+                    epochMs = room.createdAt;
+                }
             }
-            ws.send(JSON.stringify({ type: 'pong' }));
+            ws.send(JSON.stringify({
+                type: 'pong',
+                c_ms: msg.c_ms || 0,
+                s_ms: Date.now(),
+                epoch_ms: epochMs
+            }));
             break;
+        }
+    }
+}
+
+/**
+ * Difunde un paquete binario a todos los miembros de la sala excepto senderPeerId.
+ */
+function broadcastToRoom(room, senderPeerId, packet, droppable) {
+    for (const [peerId, clientWs] of room.players) {
+        if (peerId !== senderPeerId && clientWs.readyState === WebSocket.OPEN) {
+            if (clientWs.bufferedAmount > MAX_BUFFERED_HARD) {
+                // Cliente muerto/atascado: expulsarlo en vez de acumular memoria sin límite
+                console.warn(`[!] Cliente ${peerId} atascado (${clientWs.bufferedAmount} B), cerrando`);
+                clientWs.terminate();
+                continue;
+            }
+            if (droppable && clientWs.bufferedAmount > MAX_BUFFERED_DROPPABLE) {
+                continue;
+            }
+            clientWs.send(packet, { binary: true });
         }
     }
 }
@@ -310,28 +341,19 @@ function handleGamePacket(ws, packet) {
 
     // Solo se pueden descartar paquetes "efímeros" (snapshot / car_state / input),
     // porque llegará uno más nuevo enseguida. Los mensajes críticos (lobby, start_race,
-    // hit, event, join, return_to_lobby, torneo...) NUNCA se descartan: perderlos
+    // hit, hit_report, event, join, return_to_lobby, torneo...) NUNCA se descartan: perderlos
     // deja a los clientes desincronizados o atascados.
-    const droppable = isDroppablePacket(packet);
+    const cmd = readGodotCmd(packet);
+    const droppable = cmd !== null && DROPPABLE_CMDS.has(cmd);
 
     if (ws.isHost) {
         // El host difunde snapshots o eventos a todos los clientes de su sala
-        for (const [peerId, clientWs] of room.players) {
-            if (peerId !== 1 && clientWs.readyState === WebSocket.OPEN) {
-                if (clientWs.bufferedAmount > MAX_BUFFERED_HARD) {
-                    // Cliente muerto/atascado: expulsarlo en vez de acumular memoria sin límite
-                    console.warn(`[!] Cliente ${peerId} atascado (${clientWs.bufferedAmount} B), cerrando`);
-                    clientWs.terminate();
-                    continue;
-                }
-                if (droppable && clientWs.bufferedAmount > MAX_BUFFERED_DROPPABLE) {
-                    continue;
-                }
-                clientWs.send(packet, { binary: true });
-            }
-        }
+        broadcastToRoom(room, 1, packet, droppable);
+    } else if (cmd === 'car_state') {
+        // Un solo salto por Render: el estado del coche de cada cliente va directo al host y demás clientes
+        broadcastToRoom(room, ws.peerId, packet, true);
     } else {
-        // Los clientes envían sus inputs únicamente al host
+        // Los demás mensajes del cliente (join, set_car, hit_report, input) van únicamente al host
         if (room.hostWs && room.hostWs.readyState === WebSocket.OPEN) {
             if (droppable && room.hostWs.bufferedAmount > MAX_BUFFERED_DROPPABLE) {
                 return;
@@ -370,11 +392,6 @@ function readGodotCmd(buf) {
     } catch (e) {
         return null;
     }
-}
-
-function isDroppablePacket(packet) {
-    const cmd = readGodotCmd(packet);
-    return cmd !== null && DROPPABLE_CMDS.has(cmd);
 }
 
 /**
