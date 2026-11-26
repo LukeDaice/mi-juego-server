@@ -12,9 +12,330 @@
  */
 
 const http = require('http');
+const https = require('https');
+const fs = require('fs');
+const path = require('path');
 const WebSocket = require('ws');
 
 const PORT = process.env.PORT || 8080;
+
+// ===================================================================
+// Clasificación online (Contrarreloj): mejor vuelta por piloto y pista
+// ===================================================================
+// Se guarda en memoria + JSON local. En Render gratis el disco se borra al
+// reiniciar, así que si están definidas UPSTASH_REDIS_REST_URL y
+// UPSTASH_REDIS_REST_TOKEN se guarda también en una base de datos Upstash
+// Redis (gratis) y se recarga de ahí al arrancar.
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+const REDIS_URL = (process.env.UPSTASH_REDIS_REST_URL || '').trim().replace(/\/+$/, '');
+const REDIS_TOKEN = (process.env.UPSTASH_REDIS_REST_TOKEN || '').trim();
+const REDIS_ON = !!(REDIS_URL && REDIS_TOKEN);
+const REDIS_TRACKS_KEY = 'lb:tracks';            // SET con los nombres de pista
+const redisTrackKey = (t) => 'lb:track:' + t;     // HASH playerId -> JSON de la entrada
+const LB_FILE = path.join(DATA_DIR, 'leaderboard.json');
+const LB_MIN_LAP = 3.0;      // segundos: por debajo se considera trampa/error
+const LB_MAX_LAP = 1800.0;
+const LB_MAX_PER_TRACK = 500;
+
+// leaderboard: { [track]: { [playerId]: { name, lap, total, car, at } } }
+let leaderboard = {};
+try {
+    if (fs.existsSync(LB_FILE)) {
+        leaderboard = JSON.parse(fs.readFileSync(LB_FILE, 'utf8')) || {};
+    }
+} catch (e) {
+    console.error('No se pudo leer la clasificación:', e.message);
+    leaderboard = {};
+}
+
+// Entradas cambiadas pendientes de escribir en Redis: track -> Set(playerId)
+const lbDirty = new Map();
+function markDirty(track, playerId) {
+    if (!REDIS_ON) return;
+    if (!lbDirty.has(track)) lbDirty.set(track, new Set());
+    lbDirty.get(track).add(playerId);
+}
+
+let lbSaveTimer = null;
+function scheduleLeaderboardSave(delay = 2000) {
+    if (lbSaveTimer) return;
+    lbSaveTimer = setTimeout(() => {
+        lbSaveTimer = null;
+        try {
+            fs.mkdirSync(DATA_DIR, { recursive: true });
+            const tmp = LB_FILE + '.tmp';
+            fs.writeFileSync(tmp, JSON.stringify(leaderboard));
+            fs.renameSync(tmp, LB_FILE);
+        } catch (e) {
+            console.error('No se pudo guardar la clasificación:', e.message);
+        }
+        flushToRedis();
+    }, delay);
+}
+
+// --- Upstash Redis (API REST, sin dependencias) ---------------------------
+
+/** Ejecuta varios comandos Redis en una sola petición. Devuelve el array de resultados. */
+function redisPipeline(commands) {
+    return new Promise((resolve, reject) => {
+        const body = JSON.stringify(commands);
+        let url;
+        try { url = new URL(REDIS_URL + '/pipeline'); } catch (e) { reject(e); return; }
+        const lib = url.protocol === 'http:' ? http : https; // http sólo para pruebas locales
+        const req = lib.request(url, {
+            method: 'POST',
+            headers: {
+                'Authorization': 'Bearer ' + REDIS_TOKEN,
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(body)
+            },
+            timeout: 10000
+        }, (res) => {
+            const chunks = [];
+            res.on('data', (c) => chunks.push(c));
+            res.on('end', () => {
+                const text = Buffer.concat(chunks).toString('utf8');
+                if (res.statusCode !== 200) { reject(new Error(`HTTP ${res.statusCode}: ${text.substring(0, 200)}`)); return; }
+                try {
+                    const out = JSON.parse(text);
+                    const err = Array.isArray(out) && out.find((r) => r && r.error);
+                    if (err) { reject(new Error(err.error)); return; }
+                    resolve(Array.isArray(out) ? out.map((r) => r.result) : []);
+                } catch (e) { reject(e); }
+            });
+        });
+        req.on('timeout', () => req.destroy(new Error('timeout')));
+        req.on('error', reject);
+        req.end(body);
+    });
+}
+
+let lbLoaded = !REDIS_ON;   // hasta cargar de Redis no se escribe en él (para no pisar datos)
+let lbFlushing = false;
+
+function flushToRedis() {
+    if (!REDIS_ON || !lbLoaded || lbFlushing || lbDirty.size === 0) return;
+    const batch = new Map(lbDirty);
+    lbDirty.clear();
+    const cmds = [];
+    for (const [track, ids] of batch) {
+        const board = leaderboard[track] || {};
+        const hset = ['HSET', redisTrackKey(track)];
+        const hdel = ['HDEL', redisTrackKey(track)];
+        for (const pid of ids) {
+            if (board[pid]) hset.push(pid, JSON.stringify(board[pid]));
+            else hdel.push(pid);
+        }
+        cmds.push(['SADD', REDIS_TRACKS_KEY, track]);
+        if (hset.length > 2) cmds.push(hset);
+        if (hdel.length > 2) cmds.push(hdel);
+    }
+    lbFlushing = true;
+    redisPipeline(cmds).then(() => {
+        lbFlushing = false;
+        if (lbDirty.size) scheduleLeaderboardSave();
+    }).catch((e) => {
+        lbFlushing = false;
+        console.error('No se pudo guardar la clasificación en Redis (se reintentará):', e.message || e.code || String(e));
+        for (const [track, ids] of batch) for (const pid of ids) markDirty(track, pid);
+        scheduleLeaderboardSave(15000);
+    });
+}
+
+/** Carga la clasificación de Redis y la mezcla con la de memoria (gana la mejor vuelta). */
+async function loadFromRedis() {
+    const [tracks] = await redisPipeline([['SMEMBERS', REDIS_TRACKS_KEY]]);
+    const list = Array.isArray(tracks) ? tracks : [];
+    const results = list.length ? await redisPipeline(list.map((t) => ['HGETALL', redisTrackKey(t)])) : [];
+    let total = 0;
+    list.forEach((track, i) => {
+        const flat = Array.isArray(results[i]) ? results[i] : [];
+        if (!leaderboard[track]) leaderboard[track] = {};
+        const board = leaderboard[track];
+        const remote = {};
+        for (let k = 0; k + 1 < flat.length; k += 2) {
+            try { remote[flat[k]] = JSON.parse(flat[k + 1]); } catch (e) { /* entrada corrupta: ignorar */ }
+        }
+        for (const [pid, e] of Object.entries(remote)) {
+            if (!e || !isFinite(e.lap)) continue;
+            total++;
+            if (!board[pid] || e.lap <= board[pid].lap) board[pid] = e;
+        }
+        // Entradas locales mejores que las de Redis: subirlas
+        for (const pid of Object.keys(board)) {
+            if (!remote[pid] || board[pid].lap < remote[pid].lap) markDirty(track, pid);
+        }
+    });
+    for (const track of Object.keys(leaderboard)) {
+        if (!list.includes(track)) for (const pid of Object.keys(leaderboard[track])) markDirty(track, pid);
+    }
+    return { tracks: list.length, total };
+}
+
+let lbReady = Promise.resolve();
+if (REDIS_ON) {
+    lbReady = new Promise((resolve) => {
+        let attempt = 0;
+        const tryLoad = () => {
+            attempt++;
+            loadFromRedis().then(({ tracks, total }) => {
+                lbLoaded = true;
+                console.log(`[⏱] Clasificación cargada de Upstash Redis: ${total} tiempos en ${tracks} pistas`);
+                scheduleLeaderboardSave(100);
+                resolve();
+            }).catch((e) => {
+                console.error(`No se pudo cargar la clasificación de Redis (intento ${attempt}):`, e.message || e.code || String(e));
+                if (attempt === 2) resolve(); // no bloquear las peticiones para siempre
+                setTimeout(tryLoad, Math.min(30000, 3000 * attempt));
+            });
+        };
+        tryLoad();
+    });
+} else {
+    console.log('[⏱] Clasificación sin base de datos (solo archivo local). Define UPSTASH_REDIS_REST_URL y UPSTASH_REDIS_REST_TOKEN para conservarla.');
+}
+
+function cleanText(s, max) {
+    return String(s == null ? '' : s).replace(/[\u0000-\u001f\u007f]/g, '').trim().substring(0, max);
+}
+
+function sortedTrack(track) {
+    const entries = leaderboard[track] ? Object.entries(leaderboard[track]) : [];
+    entries.sort((a, b) => a[1].lap - b[1].lap || a[1].at - b[1].at);
+    return entries;
+}
+
+function trackStanding(track, playerId) {
+    const sorted = sortedTrack(track);
+    const idx = playerId ? sorted.findIndex(([pid]) => pid === playerId) : -1;
+    return { sorted, rank: idx >= 0 ? idx + 1 : 0, entry: idx >= 0 ? sorted[idx][1] : null };
+}
+
+function publicEntry([pid, e], i, playerId) {
+    return { rank: i + 1, name: e.name, lap: e.lap, total: e.total, car: e.car, at: e.at, me: pid === playerId };
+}
+
+// Límite simple de envíos por IP (evita spam)
+const lbRate = new Map();
+function rateLimited(ip) {
+    const now = Date.now();
+    const r = lbRate.get(ip) || { n: 0, t: now };
+    if (now - r.t > 60000) { r.n = 0; r.t = now; }
+    r.n++;
+    lbRate.set(ip, r);
+    return r.n > 20;
+}
+setInterval(() => {
+    const now = Date.now();
+    for (const [ip, r] of lbRate) if (now - r.t > 120000) lbRate.delete(ip);
+}, 60000);
+
+function sendJson(res, status, obj) {
+    res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
+    res.end(JSON.stringify(obj));
+}
+
+function readBody(req, maxBytes, cb) {
+    let size = 0;
+    const chunks = [];
+    req.on('data', (c) => {
+        size += c.length;
+        if (size > maxBytes) { req.destroy(); return; }
+        chunks.push(c);
+    });
+    req.on('end', () => cb(Buffer.concat(chunks).toString('utf8')));
+}
+
+function handleLeaderboard(req, res, url) {
+    if (req.method === 'GET' && url.pathname === '/api/leaderboard/tracks') {
+        const tracks = Object.keys(leaderboard).map((t) => {
+            const top = sortedTrack(t)[0];
+            return { track: t, count: Object.keys(leaderboard[t]).length, best: top ? { name: top[1].name, lap: top[1].lap } : null };
+        });
+        sendJson(res, 200, { ok: true, tracks });
+        return true;
+    }
+
+    if (req.method === 'GET' && url.pathname === '/api/leaderboard') {
+        const track = cleanText(url.searchParams.get('track'), 64);
+        const playerId = cleanText(url.searchParams.get('player_id'), 64);
+        const limit = Math.min(Math.max(parseInt(url.searchParams.get('limit') || '20', 10) || 20, 1), 100);
+        if (!track) { sendJson(res, 400, { ok: false, error: 'Falta la pista' }); return true; }
+        const { sorted, rank, entry } = trackStanding(track, playerId);
+        sendJson(res, 200, {
+            ok: true,
+            track,
+            count: sorted.length,
+            entries: sorted.slice(0, limit).map((e, i) => publicEntry(e, i, playerId)),
+            me: entry ? { rank, name: entry.name, lap: entry.lap, total: entry.total, car: entry.car, at: entry.at, me: true } : null
+        });
+        return true;
+    }
+
+    if (req.method === 'POST' && url.pathname === '/api/leaderboard/submit') {
+        const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').toString().split(',')[0].trim();
+        if (rateLimited(ip)) { sendJson(res, 429, { ok: false, error: 'Demasiados envíos, espera un minuto' }); return true; }
+        readBody(req, 4096, (raw) => {
+            let d;
+            try { d = JSON.parse(raw); } catch (e) { sendJson(res, 400, { ok: false, error: 'JSON inválido' }); return; }
+            const track = cleanText(d.track, 64);
+            const playerId = cleanText(d.player_id, 64);
+            const name = cleanText(d.name, 24) || 'Piloto';
+            const car = cleanText(d.car, 32);
+            const lap = Number(d.lap);
+            const total = Number(d.total);
+            if (!track || !/^[A-Za-z0-9_-]{8,64}$/.test(playerId)) {
+                sendJson(res, 400, { ok: false, error: 'Datos incompletos' }); return;
+            }
+            if (!isFinite(lap) || lap < LB_MIN_LAP || lap > LB_MAX_LAP) {
+                sendJson(res, 400, { ok: false, error: 'Tiempo de vuelta no válido' }); return;
+            }
+            if (isFinite(total) && total > 0 && total + 0.01 < lap) {
+                sendJson(res, 400, { ok: false, error: 'Tiempos incoherentes' }); return;
+            }
+            if (!leaderboard[track]) {
+                if (Object.keys(leaderboard).length >= 200) { sendJson(res, 400, { ok: false, error: 'Pista desconocida' }); return; }
+                leaderboard[track] = {};
+            }
+            const board = leaderboard[track];
+            const prev = board[playerId];
+            const improved = !prev || lap < prev.lap;
+            if (improved) {
+                board[playerId] = {
+                    name, car,
+                    lap: Math.round(lap * 1000) / 1000,
+                    total: isFinite(total) && total > 0 ? Math.round(total * 1000) / 1000 : 0,
+                    at: Date.now()
+                };
+                markDirty(track, playerId);
+            } else if (prev.name !== name) {
+                prev.name = name; // el piloto cambió de nombre: actualizarlo igualmente
+                markDirty(track, playerId);
+            }
+            // Recortar pistas enormes conservando los mejores
+            const ids = Object.keys(board);
+            if (ids.length > LB_MAX_PER_TRACK) {
+                for (const [pid] of sortedTrack(track).slice(LB_MAX_PER_TRACK)) {
+                    delete board[pid];
+                    markDirty(track, pid);
+                }
+            }
+            scheduleLeaderboardSave();
+            const { sorted, rank, entry } = trackStanding(track, playerId);
+            if (improved) console.log(`[⏱] ${name} marcó ${lap.toFixed(3)}s en "${track}" (puesto ${rank}/${sorted.length})`);
+            sendJson(res, 200, {
+                ok: true,
+                improved,
+                rank,
+                count: sorted.length,
+                best: entry ? entry.lap : lap
+            });
+        });
+        return true;
+    }
+
+    return false;
+}
 
 // Almacén de salas en memoria
 // Clave: roomId -> { id, roomName, hostName, maxPlayers, players: Map<peerId, socket>, isRacing, createdAt, lastHeartbeat }
@@ -30,6 +351,16 @@ const server = http.createServer((req, res) => {
     if (req.method === 'OPTIONS') {
         res.writeHead(204);
         res.end();
+        return;
+    }
+
+    let parsedUrl;
+    try { parsedUrl = new URL(req.url, 'http://localhost'); } catch (e) { parsedUrl = null; }
+    if (parsedUrl && parsedUrl.pathname.startsWith('/api/leaderboard')) {
+        // Esperar a que se cargue la clasificación de la base de datos (tras despertar)
+        lbReady.then(() => {
+            if (!handleLeaderboard(req, res, parsedUrl)) sendJson(res, 404, { ok: false, error: 'Not Found' });
+        });
         return;
     }
 
@@ -492,12 +823,34 @@ setInterval(() => {
     });
 }, 5000);
 
+// Render apaga el servicio con SIGTERM (al dormir o desplegar): subir lo pendiente antes de salir
+let shuttingDown = false;
+function shutdown(sig) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    if (!REDIS_ON || !lbLoaded || (lbDirty.size === 0 && !lbFlushing)) process.exit(0);
+    console.log(`[${sig}] Guardando la clasificación antes de salir...`);
+    if (lbSaveTimer) { clearTimeout(lbSaveTimer); lbSaveTimer = null; }
+    flushToRedis();
+    const started = Date.now();
+    const wait = setInterval(() => {
+        if ((!lbFlushing && lbDirty.size === 0) || Date.now() - started > 8000) {
+            clearInterval(wait);
+            process.exit(0);
+        }
+        if (!lbFlushing && lbDirty.size) flushToRedis();
+    }, 100);
+}
+process.on('SIGTERM', () => shutdown('SIGTERM'));
+process.on('SIGINT', () => shutdown('SIGINT'));
+
 // Iniciar servidor
 server.listen(PORT, () => {
     console.log(`=======================================================`);
     console.log(`🏁 SERVIDOR RELAY DE CARRERAS INICIADO EN PUERTO ${PORT}`);
     console.log(`   Panel Web:      http://localhost:${PORT}`);
     console.log(`   Endpoint API:   http://localhost:${PORT}/api/rooms`);
+    console.log(`   Clasificación:  http://localhost:${PORT}/api/leaderboard/tracks`);
     console.log(`   WebSocket URL:  ws://localhost:${PORT}`);
     console.log(`=======================================================`);
 });

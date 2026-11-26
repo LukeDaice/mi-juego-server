@@ -42,6 +42,30 @@ Para que tus amigos puedan jugar contigo sin que tengas tu computadora encendida
 
 ---
 
+## ⏱️ Clasificación online (Contrarreloj)
+El mismo servidor guarda la **mejor vuelta de cada piloto en cada pista**:
+- `GET  /api/leaderboard?track=<pista>&player_id=<id>&limit=20` → tabla de la pista y tu puesto.
+- `GET  /api/leaderboard/tracks` → resumen de todas las pistas.
+- `POST /api/leaderboard/submit` → `{ track, player_id, name, lap, total, car }` (lo envía el juego al terminar una contrarreloj).
+
+En el plan **gratis** de Render el disco se borra en cada reinicio, así que la tabla se guarda en una
+base de datos **Upstash Redis gratuita** (sin tarjeta). Configuración, una sola vez:
+
+1. Entra en **[upstash.com](https://upstash.com)** y crea una cuenta gratis (puedes entrar con GitHub).
+2. **Create Database** → tipo **Redis**, nombre p. ej. `carreras`, región la más cercana a tu servidor de Render, plan **Free**.
+3. En la página de la base de datos, en la sección **REST API**, copia:
+   - `UPSTASH_REDIS_REST_URL` (algo como `https://xxxx.upstash.io`)
+   - `UPSTASH_REDIS_REST_TOKEN` (una clave larga)
+4. En **Render** → tu servicio → **Environment** → **Add Environment Variable**, añade esas dos variables con esos nombres exactos y guarda.
+   Render reiniciará el servidor solo.
+5. En los **Logs** de Render debe aparecer: `Clasificación cargada de Upstash Redis: ...` ✅
+
+Sin esas variables el servidor sigue funcionando, pero solo guarda en `data/leaderboard.json` (y se pierde al reiniciar).
+El plan gratis de Upstash da de sobra: cada tiempo nuevo gasta 2 comandos y cada arranque del servidor unos pocos (mira los límites actuales en su web).
+⚠️ El token de Upstash es una contraseña: ponlo solo en Render, nunca en el juego ni en GitHub.
+
+---
+
 ## 📱 ¿Y si estamos en el mismo lugar o compartimos datos?
 Si tú y tus amigos están en la misma red Wi-Fi o compartes el punto de acceso (zona Wi-Fi portátil) de tu celular:
 - **No necesitas internet ni este servidor**.
