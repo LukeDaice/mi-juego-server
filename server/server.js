@@ -15,9 +15,70 @@ const http = require('http');
 const https = require('https');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 const WebSocket = require('ws');
 
 const PORT = process.env.PORT || 8080;
+
+// ===================================================================
+// Seguridad de salas
+// ===================================================================
+// Versión del protocolo de red. Súbela cuando cambie el formato de los paquetes:
+// los clientes con otra versión reciben un error claro en vez de fallos raros.
+// v2: el servidor antepone 4 bytes (u32 LE) con el peer_id del remitente a cada paquete binario.
+// v3: si el anfitrión se va en plena carrera, la carrera continúa con el heredero (no vuelve al lobby).
+const PROTOCOL_VERSION = 3;
+const MAX_WS_PAYLOAD = 64 * 1024;          // ningún paquete legítimo del juego se acerca a esto
+const CREATE_LIMIT_PER_MIN = 6;            // salas creadas por IP y minuto
+const JOIN_LIMIT_PER_MIN = 20;             // intentos de unirse por IP y minuto
+const PASSWORD_FAILS_MAX = 5;              // fallos de contraseña por IP y sala...
+const PASSWORD_LOCK_MS = 60000;            // ...antes de bloquear durante este tiempo
+const PASSWORD_MIN_LEN = 3;
+const PASSWORD_MAX_LEN = 32;
+const CODE_LEN_PUBLIC = 4;
+const CODE_LEN_HIDDEN = 6;                 // salas ocultas: código más largo para que no se pueda adivinar
+const RECONNECT_GRACE_MS = 30000;          // un jugador que pierde la conexión conserva su hueco este tiempo
+const HOST_GRACE_MS = 12000;               // el anfitrión: pasado este tiempo, otro jugador hereda la sala
+const HOST_GRACE_RACING_MS = 6000;         // en carrera se espera menos: sin anfitrión la IA está congelada
+
+function newToken() {
+    return crypto.randomBytes(18).toString('base64url');
+}
+
+/** Contador por ventana de tiempo. Devuelve true si se superó el límite. */
+const rateBuckets = new Map();
+function overLimit(key, limit, windowMs) {
+    const now = Date.now();
+    let b = rateBuckets.get(key);
+    if (!b || now - b.t > windowMs) { b = { n: 0, t: now }; rateBuckets.set(key, b); }
+    b.n++;
+    return b.n > limit;
+}
+setInterval(() => {
+    const now = Date.now();
+    for (const [k, b] of rateBuckets) if (now - b.t > 5 * 60000) rateBuckets.delete(k);
+}, 60000);
+
+function hashPassword(pw) {
+    const salt = crypto.randomBytes(16);
+    return { salt, hash: crypto.scryptSync(pw, salt, 32) };
+}
+
+function checkPassword(room, pw) {
+    if (!room.passwordHash) return true;
+    if (typeof pw !== 'string' || pw.length === 0 || pw.length > PASSWORD_MAX_LEN) return false;
+    const h = crypto.scryptSync(pw, room.passwordHash.salt, 32);
+    return crypto.timingSafeEqual(h, room.passwordHash.hash);
+}
+
+function clientIp(req) {
+    return ((req && req.headers && req.headers['x-forwarded-for']) || (req && req.socket && req.socket.remoteAddress) || '')
+        .toString().split(',')[0].trim() || 'unknown';
+}
+
+function sendError(ws, code, message) {
+    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'error', code, message }));
+}
 
 // ===================================================================
 // Clasificación online (Contrarreloj): mejor vuelta por piloto y pista
@@ -382,7 +443,7 @@ const server = http.createServer((req, res) => {
         const roomList = getPublicRoomsList();
         const rowsHtml = roomList.map(r => `
             <tr style="border-bottom: 1px solid #2a3447;">
-                <td style="padding: 10px; font-weight: bold; color: #ff9800;">${escapeHtml(r.roomName)}</td>
+                <td style="padding: 10px; font-weight: bold; color: #ff9800;">${r.locked ? '🔒 ' : ''}${escapeHtml(r.roomName)}</td>
                 <td style="padding: 10px; color: #90caf9;">${escapeHtml(r.hostName)}</td>
                 <td style="padding: 10px; text-align: center;">${r.playerCount} / ${r.maxPlayers}</td>
                 <td style="padding: 10px; text-align: center;">
@@ -450,12 +511,13 @@ const server = http.createServer((req, res) => {
 // Servidor WebSocket integrado (baja latencia para juegos en tiempo real)
 const wss = new WebSocket.Server({
     server,
-    perMessageDeflate: false // Desactiva compresión innecesaria para evitar delay en paquetes pequeños
+    perMessageDeflate: false, // Desactiva compresión innecesaria para evitar delay en paquetes pequeños
+    maxPayload: MAX_WS_PAYLOAD // por defecto ws acepta 100 MB: un solo mensaje enorme tumbaría el servidor
 });
 
 let nextPeerId = 2; // El Host siempre es el peer ID 1 en Godot
 
-wss.on('connection', (ws) => {
+wss.on('connection', (ws, req) => {
     // Desactivar el algoritmo de Nagle en TCP para enviar paquetes de inmediato (sin buffer latency)
     if (ws._socket && typeof ws._socket.setNoDelay === 'function') {
         ws._socket.setNoDelay(true);
@@ -465,6 +527,7 @@ wss.on('connection', (ws) => {
     ws.roomId = null;
     ws.peerId = null;
     ws.isHost = false;
+    ws.ip = clientIp(req);
 
     ws.on('pong', () => { ws.isAlive = true; });
 
@@ -475,14 +538,14 @@ wss.on('connection', (ws) => {
             return;
         }
 
-        // Si es texto, es señalización de control (JSON)
+        // Si es texto, es señalización de control (JSON). El texto que no es JSON se descarta.
+        let data;
         try {
-            const data = JSON.parse(message.toString());
-            handleControlMessage(ws, data);
+            data = JSON.parse(message.toString());
         } catch (err) {
-            // Si llega texto no-JSON o buffer, retransmitir
-            handleGamePacket(ws, message);
+            return;
         }
+        if (data && typeof data === 'object') handleControlMessage(ws, data);
     });
 
     ws.on('close', () => {
@@ -503,16 +566,135 @@ function handleControlMessage(ws, msg) {
 
     switch (type) {
         case 'leave': {
-            // Salida explícita: el cliente avisa antes de cerrar (los proxies tardan ~10 s en propagar el cierre)
-            handleDisconnect(ws);
+            // Salida explícita: el cliente avisa antes de cerrar (los proxies tardan ~10 s en propagar el cierre).
+            // No se reserva hueco: quien sale a propósito no va a reconectar.
+            handleDisconnect(ws, true);
+            break;
+        }
+
+        case 'rejoin': {
+            // Vuelta tras un corte de red (cambio WiFi/4G, túnel...): mismo hueco y mismo peer_id.
+            if (Number(msg.protocol) !== PROTOCOL_VERSION) {
+                sendError(ws, 'version', 'Tu versión del juego no coincide con la del servidor. Actualiza el juego.');
+                return;
+            }
+            if (overLimit('join|' + ws.ip, JOIN_LIMIT_PER_MIN, 60000)) {
+                sendError(ws, 'rate_limited', 'Demasiados intentos. Espera un minuto.');
+                return;
+            }
+            const room = rooms.get(cleanText(msg.room_id, 12).toUpperCase());
+            const token = typeof msg.token === 'string' ? msg.token : '';
+            const peerId = room && token ? room.sessions.get(token) : undefined;
+            if (!room || peerId === undefined) {
+                sendError(ws, 'session_expired', 'Ya no se puede volver a la sala.');
+                return;
+            }
+            const away = room.away.get(peerId);
+            const current = room.players.get(peerId);
+            if (!away && !current) {
+                sendError(ws, 'session_expired', 'Ya no se puede volver a la sala.');
+                return;
+            }
+            if (ws.roomId && ws !== current) handleDisconnect(ws, true);
+            if (away) {
+                clearTimeout(away.timer);
+                room.away.delete(peerId);
+            } else if (current !== ws) {
+                // El servidor aún no notó que la conexión vieja murió (típico al cambiar de red): reemplazarla.
+                current.roomId = null;
+                try { current.terminate(); } catch (e) { /* ignorar */ }
+            }
+            ws.roomId = room.id;
+            ws.peerId = peerId;
+            ws.isHost = peerId === 1;
+            ws.playerName = away ? away.name : current.playerName;
+            ws.token = token;
+            room.players.set(peerId, ws);
+            if (ws.isHost) room.hostWs = ws;
+            room.lastHeartbeat = Date.now();
+            console.log(`[↺] "${ws.playerName}" (peer ${peerId}) volvió a la sala "${room.roomName}"`);
+
+            ws.send(JSON.stringify({
+                type: 'room_rejoined',
+                room_id: room.id,
+                room_name: room.roomName,
+                host_name: room.hostName,
+                peer_id: peerId,
+                is_host: ws.isHost,
+                hidden: room.hidden,
+                locked: !!room.passwordHash,
+                closed: room.closed,
+                is_racing: room.isRacing,
+                epoch_ms: room.createdAt
+            }));
+            if (away) {
+                if (ws.isHost) notifyClients(room, { type: 'host_back' });
+                else notifyHost(room, { type: 'peer_back', peer_id: peerId });
+            }
+            break;
+        }
+
+        case 'kick': {
+            // Solo el anfitrión. ban = además bloquear su IP en esta sala.
+            if (!ws.roomId || !ws.isHost) return;
+            const room = rooms.get(ws.roomId);
+            const target = Number(msg.peer_id);
+            if (!room || !target || target === 1) return;
+            const tws = room.players.get(target);
+            const away = room.away.get(target);
+            const ban = !!msg.ban;
+            if (ban) {
+                const ip = tws ? tws.ip : (away ? away.ip : '');
+                if (ip) room.banned.add(ip);
+            }
+            if (tws) {
+                if (tws.readyState === WebSocket.OPEN) {
+                    tws.send(JSON.stringify({
+                        type: 'kicked',
+                        banned: ban,
+                        message: ban ? 'El anfitrión te ha bloqueado en esta sala.' : 'El anfitrión te ha expulsado de la sala.'
+                    }));
+                }
+                handleDisconnect(tws, true);
+                setTimeout(() => { try { tws.close(4001, 'kicked'); } catch (e) { /* ignorar */ } }, 100);
+            } else if (away) {
+                clearTimeout(away.timer);
+                room.away.delete(target);
+                finalizeLeave(room, target, away.token, false, away.name);
+            }
+            console.log(`[✖] Peer ${target} ${ban ? 'bloqueado' : 'expulsado'} de "${room.roomName}"`);
+            break;
+        }
+
+        case 'set_closed': {
+            // El anfitrión cierra/abre la entrada aunque haya sitio
+            if (!ws.roomId || !ws.isHost) return;
+            const room = rooms.get(ws.roomId);
+            if (!room) return;
+            room.closed = !!msg.closed;
+            ws.send(JSON.stringify({ type: 'room_state', closed: room.closed }));
             break;
         }
 
         case 'create_room': {
-            if (ws.roomId) handleDisconnect(ws); // ya estaba en otra sala: salir primero
-            const roomId = generateRoomCode();
-            const roomName = (msg.room_name || 'Sala de Carreras').trim().substring(0, 40);
-            const hostName = (msg.host_name || 'Anfitrión').trim().substring(0, 24);
+            if (Number(msg.protocol) !== PROTOCOL_VERSION) {
+                sendError(ws, 'version', 'Tu versión del juego no coincide con la del servidor. Actualiza el juego.');
+                return;
+            }
+            if (overLimit('create|' + ws.ip, CREATE_LIMIT_PER_MIN, 60000)) {
+                sendError(ws, 'rate_limited', 'Has creado demasiadas salas. Espera un minuto.');
+                return;
+            }
+            const password = typeof msg.password === 'string' ? msg.password : '';
+            if (password && (password.length < PASSWORD_MIN_LEN || password.length > PASSWORD_MAX_LEN)) {
+                sendError(ws, 'bad_password', `La contraseña debe tener entre ${PASSWORD_MIN_LEN} y ${PASSWORD_MAX_LEN} caracteres.`);
+                return;
+            }
+            if (ws.roomId) handleDisconnect(ws, true); // ya estaba en otra sala: salir primero
+            const hidden = !!msg.hidden;
+            const roomId = generateRoomCode(hidden ? CODE_LEN_HIDDEN : CODE_LEN_PUBLIC);
+            const roomName = cleanText(msg.room_name, 40) || 'Sala de Carreras';
+            const hostName = cleanText(msg.host_name, 24) || 'Anfitrión';
             const maxPlayers = Math.min(Math.max(parseInt(msg.max_players || 8), 2), 8);
 
             const room = {
@@ -523,6 +705,12 @@ function handleControlMessage(ws, msg) {
                 hostWs: ws,
                 players: new Map(),
                 isRacing: false,
+                hidden: hidden,
+                passwordHash: password ? hashPassword(password) : null,
+                closed: false,               // el anfitrión cerró la entrada
+                banned: new Set(),           // IPs bloqueadas en esta sala
+                sessions: new Map(),         // token de sesión -> peerId (para reconectar)
+                away: new Map(),             // peerId -> { token, name, ip, wasHost, timer } (hueco reservado)
                 createdAt: Date.now(),
                 lastHeartbeat: Date.now()
             };
@@ -531,10 +719,13 @@ function handleControlMessage(ws, msg) {
             ws.peerId = 1; // ID 1 para el host en Godot
             ws.isHost = true;
             ws.playerName = hostName;
+            ws.token = newToken();
             room.players.set(1, ws);
+            room.sessions.set(ws.token, 1);
 
             rooms.set(roomId, room);
-            console.log(`[+] Sala creada: "${roomName}" por ${hostName} [ID: ${roomId}]`);
+            const tags = [hidden ? 'oculta' : 'pública', room.passwordHash ? 'con contraseña' : 'abierta'].join(', ');
+            console.log(`[+] Sala creada: "${roomName}" por ${hostName} [ID: ${roomId}] (${tags})`);
 
             ws.send(JSON.stringify({
                 type: 'room_created',
@@ -542,6 +733,9 @@ function handleControlMessage(ws, msg) {
                 room_name: roomName,
                 host_name: hostName,
                 peer_id: 1,
+                hidden: hidden,
+                locked: !!room.passwordHash,
+                session_token: ws.token,
                 epoch_ms: room.createdAt
             }));
             break;
@@ -556,27 +750,65 @@ function handleControlMessage(ws, msg) {
         }
 
         case 'join_room': {
-            const roomId = (msg.room_id || msg.code || '').trim().toUpperCase();
-            const clientName = (msg.player_name || 'Piloto').trim().substring(0, 24);
+            const roomId = cleanText(msg.room_id || msg.code, 12).toUpperCase();
+            const clientName = cleanText(msg.player_name, 24) || 'Piloto';
+
+            if (Number(msg.protocol) !== PROTOCOL_VERSION) {
+                sendError(ws, 'version', 'Tu versión del juego no coincide con la del servidor. Actualiza el juego.');
+                return;
+            }
+            if (overLimit('join|' + ws.ip, JOIN_LIMIT_PER_MIN, 60000)) {
+                sendError(ws, 'rate_limited', 'Demasiados intentos. Espera un minuto.');
+                return;
+            }
 
             if (ws.roomId) {
                 if (ws.roomId === roomId) return; // join duplicado: ignorar
-                handleDisconnect(ws);
+                handleDisconnect(ws, true);
             }
 
             const room = rooms.get(roomId);
             if (!room) {
-                ws.send(JSON.stringify({ type: 'error', message: 'La sala no existe o ya cerró.' }));
+                sendError(ws, 'not_found', 'La sala no existe o ya cerró.');
                 return;
+            }
+
+            if (room.banned.has(ws.ip)) {
+                sendError(ws, 'banned', 'El anfitrión te ha bloqueado en esta sala.');
+                return;
+            }
+
+            if (room.closed) {
+                sendError(ws, 'room_closed', 'El anfitrión ha cerrado la entrada a la sala.');
+                return;
+            }
+
+            if (room.passwordHash) {
+                const failKey = 'pwfail|' + ws.ip + '|' + roomId;
+                const fails = rateBuckets.get(failKey);
+                if (fails && fails.n >= PASSWORD_FAILS_MAX && Date.now() - fails.t <= PASSWORD_LOCK_MS) {
+                    sendError(ws, 'rate_limited', 'Demasiados intentos de contraseña. Espera un minuto.');
+                    return;
+                }
+                const pw = typeof msg.password === 'string' ? msg.password : '';
+                if (!pw) {
+                    sendError(ws, 'password_required', 'Esta sala tiene contraseña.');
+                    return;
+                }
+                if (!checkPassword(room, pw)) {
+                    overLimit(failKey, PASSWORD_FAILS_MAX, PASSWORD_LOCK_MS);
+                    sendError(ws, 'wrong_password', 'Contraseña incorrecta.');
+                    return;
+                }
             }
 
             if (room.isRacing) {
-                ws.send(JSON.stringify({ type: 'error', message: 'La carrera ya ha comenzado.' }));
+                sendError(ws, 'racing', 'La carrera ya ha comenzado.');
                 return;
             }
 
-            if (room.players.size >= room.maxPlayers) {
-                ws.send(JSON.stringify({ type: 'error', message: 'La sala está llena.' }));
+            if (room.players.size + room.away.size >= room.maxPlayers) {
+                sendError(ws, 'full', 'La sala está llena.');
                 return;
             }
 
@@ -585,8 +817,10 @@ function handleControlMessage(ws, msg) {
             ws.peerId = assignedPeerId;
             ws.isHost = false;
             ws.playerName = clientName;
+            ws.token = newToken();
 
             room.players.set(assignedPeerId, ws);
+            room.sessions.set(ws.token, assignedPeerId);
             console.log(`[+] Jugador "${clientName}" (peer ${assignedPeerId}) se unió a la sala "${room.roomName}"`);
 
             // Notificar al nuevo cliente
@@ -596,6 +830,7 @@ function handleControlMessage(ws, msg) {
                 room_name: room.roomName,
                 host_name: room.hostName,
                 peer_id: assignedPeerId,
+                session_token: ws.token,
                 epoch_ms: room.createdAt
             }));
 
@@ -677,21 +912,33 @@ function handleGamePacket(ws, packet) {
     const cmd = readGodotCmd(packet);
     const droppable = cmd !== null && DROPPABLE_CMDS.has(cmd);
 
+    // El remitente lo pone el servidor (lo sabe por la conexión), no el paquete:
+    // así nadie puede hacerse pasar por otro jugador ni por el anfitrión.
+    const framed = stampSender(ws.peerId, packet);
+
     if (ws.isHost) {
         // El host difunde snapshots o eventos a todos los clientes de su sala
-        broadcastToRoom(room, 1, packet, droppable);
+        broadcastToRoom(room, 1, framed, droppable);
     } else if (cmd === 'car_state') {
         // Un solo salto por Render: el estado del coche de cada cliente va directo al host y demás clientes
-        broadcastToRoom(room, ws.peerId, packet, true);
+        broadcastToRoom(room, ws.peerId, framed, true);
     } else {
         // Los demás mensajes del cliente (join, set_car, hit_report, input) van únicamente al host
         if (room.hostWs && room.hostWs.readyState === WebSocket.OPEN) {
             if (droppable && room.hostWs.bufferedAmount > MAX_BUFFERED_DROPPABLE) {
                 return;
             }
-            room.hostWs.send(packet, { binary: true });
+            room.hostWs.send(framed, { binary: true });
         }
     }
+}
+
+/** Antepone 4 bytes (u32 little-endian) con el peer_id del remitente. */
+function stampSender(peerId, packet) {
+    const out = Buffer.allocUnsafe(packet.length + 4);
+    out.writeUInt32LE(peerId >>> 0, 0);
+    packet.copy(out, 4);
+    return out;
 }
 
 const MAX_BUFFERED_DROPPABLE = 65536;     // 64 KB: a partir de aquí se descartan snapshots/inputs viejos
@@ -728,34 +975,112 @@ function readGodotCmd(buf) {
 /**
  * Maneja la desconexión de un cliente o anfitrión
  */
-function handleDisconnect(ws) {
+/**
+ * Maneja la desconexión de un cliente o anfitrión.
+ * explicit = salió a propósito (leave, expulsado, cambio de sala): se libera el hueco ya.
+ * Si se cortó la red, el hueco queda reservado unos segundos por si vuelve con su token.
+ */
+function handleDisconnect(ws, explicit = false) {
     if (!ws.roomId) return;
     const roomId = ws.roomId;
     ws.roomId = null; // idempotente: 'leave' + 'close' no deben procesarse dos veces
     const room = rooms.get(roomId);
     if (!room) return;
+    if (room.players.get(ws.peerId) !== ws) return; // esta conexión ya fue reemplazada por una reconexión
+    room.players.delete(ws.peerId);
 
-    if (ws.isHost) {
-        console.log(`[-] El anfitrión cerró la sala "${room.roomName}" [ID: ${roomId}]`);
-        // Avisar a todos los clientes que la sala se cerró
-        for (const [peerId, clientWs] of room.players) {
-            if (peerId !== 1 && clientWs.readyState === WebSocket.OPEN) {
-                clientWs.roomId = null;
-                clientWs.send(JSON.stringify({ type: 'host_disconnected', message: 'El anfitrión ha cerrado la sala.' }));
-                clientWs.close();
-            }
+    if (!explicit && ws.token && room.sessions.has(ws.token)) {
+        const peerId = ws.peerId;
+        const grace = ws.isHost ? (room.isRacing ? HOST_GRACE_RACING_MS : HOST_GRACE_MS) : RECONNECT_GRACE_MS;
+        const entry = { token: ws.token, name: ws.playerName, ip: ws.ip, wasHost: ws.isHost, timer: null };
+        entry.timer = setTimeout(() => {
+            if (room.away.get(peerId) !== entry) return;
+            room.away.delete(peerId);
+            finalizeLeave(room, peerId, entry.token, entry.wasHost, entry.name);
+        }, grace);
+        room.away.set(peerId, entry);
+        console.log(`[…] "${ws.playerName || peerId}" perdió la conexión en "${room.roomName}" (espera ${grace / 1000} s)`);
+        if (ws.isHost) {
+            room.hostWs = null;
+            notifyClients(room, { type: 'host_away', grace_ms: grace });
+        } else {
+            notifyHost(room, { type: 'peer_away', peer_id: peerId });
         }
-        rooms.delete(roomId);
+        return;
+    }
+
+    finalizeLeave(room, ws.peerId, ws.token, ws.isHost, ws.playerName);
+}
+
+/** El jugador se fue del todo: liberar su sesión y avisar (o pasar el mando si era el anfitrión). */
+function finalizeLeave(room, peerId, token, wasHost, name) {
+    if (token) room.sessions.delete(token);
+    if (rooms.get(room.id) !== room) return;
+    if (wasHost) {
+        migrateHost(room, name);
     } else {
-        console.log(`[-] Jugador "${ws.playerName || ws.peerId}" salió de la sala "${room.roomName}"`);
-        room.players.delete(ws.peerId);
-        // Avisar al host
-        if (room.hostWs && room.hostWs.readyState === WebSocket.OPEN) {
-            room.hostWs.send(JSON.stringify({
-                type: 'peer_disconnected',
-                peer_id: ws.peerId
-            }));
+        console.log(`[-] Jugador "${name || peerId}" salió de la sala "${room.roomName}"`);
+        notifyHost(room, { type: 'peer_disconnected', peer_id: peerId });
+    }
+    if (rooms.get(room.id) === room && room.players.size === 0 && room.away.size === 0) {
+        closeRoom(room, 'vacía');
+    }
+}
+
+/**
+ * El anfitrión se fue: hereda la sala el jugador conectado que lleva más tiempo (peer_id más bajo).
+ * El heredero pasa a ser el peer 1, porque todo el juego asume que el anfitrión es el 1.
+ * Si había carrera, sigue: el heredero toma el control de la IA, los choques y la meta
+ * desde el último estado que tenía (in_race avisa a los clientes para no reordenar la parrilla).
+ */
+function migrateHost(room, oldName) {
+    room.hostWs = null;
+    let best = null;
+    for (const [pid, w] of room.players) {
+        if (w.readyState === WebSocket.OPEN && (best === null || pid < best)) best = pid;
+    }
+    if (best === null) {
+        closeRoom(room, 'sin jugadores conectados para heredarla');
+        return;
+    }
+    const heir = room.players.get(best);
+    const inRace = room.isRacing;
+    room.players.delete(best);
+    heir.peerId = 1;
+    heir.isHost = true;
+    room.players.set(1, heir);
+    if (heir.token) room.sessions.set(heir.token, 1);
+    room.hostWs = heir;
+    room.hostName = heir.playerName || room.hostName;
+    console.log(`[⇄] "${oldName}" dejó "${room.roomName}": nuevo anfitrión "${room.hostName}" (era peer ${best})${inRace ? ' — la carrera continúa' : ''}`);
+
+    heir.send(JSON.stringify({ type: 'you_are_host', old_peer_id: best, host_name: room.hostName, in_race: inRace, race_aborted: false }));
+    notifyClients(room, { type: 'host_migrated', new_host_old_peer: best, host_name: room.hostName, in_race: inRace, race_aborted: false });
+}
+
+function closeRoom(room, reason) {
+    for (const [, entry] of room.away) clearTimeout(entry.timer);
+    room.away.clear();
+    for (const [peerId, clientWs] of room.players) {
+        clientWs.roomId = null;
+        if (clientWs.readyState === WebSocket.OPEN) {
+            clientWs.send(JSON.stringify({ type: 'host_disconnected', message: 'La sala se ha cerrado.' }));
+            clientWs.close();
         }
+    }
+    room.players.clear();
+    rooms.delete(room.id);
+    console.log(`[-] Sala "${room.roomName}" [ID: ${room.id}] cerrada (${reason})`);
+}
+
+function notifyHost(room, obj) {
+    if (room.hostWs && room.hostWs.readyState === WebSocket.OPEN) room.hostWs.send(JSON.stringify(obj));
+}
+
+function notifyClients(room, obj) {
+    const text = JSON.stringify(obj);
+    for (const [peerId, w] of room.players) {
+        if (peerId !== 1 && w.readyState === WebSocket.OPEN) w.send(text);
     }
 }
 
@@ -770,21 +1095,21 @@ function getPublicRoomsList() {
         // Si una sala no ha tenido latidos en 30 segundos, considerarla inactiva
         if (now - r.lastHeartbeat > 30000) {
             // Cerrar de verdad al host y clientes (antes quedaban "huérfanos" sin sala)
-            for (const [, pws] of r.players) {
-                pws.roomId = null;
-                try { pws.close(1001, 'Sala inactiva'); } catch (e) { /* ignorar */ }
-            }
-            rooms.delete(id);
+            closeRoom(r, 'inactiva');
             continue;
         }
+
+        if (r.hidden) continue; // salas ocultas: solo se entra con el código
 
         list.push({
             id: r.id,
             roomName: r.roomName,
             hostName: r.hostName,
-            playerCount: r.players.size,
+            playerCount: r.players.size + r.away.size,
             maxPlayers: r.maxPlayers,
-            isRacing: r.isRacing
+            isRacing: r.isRacing,
+            locked: !!r.passwordHash,
+            closed: !!r.closed
         });
     }
 
@@ -794,12 +1119,12 @@ function getPublicRoomsList() {
 /**
  * Genera un código de sala corto y legible (ej. "RAC-72")
  */
-function generateRoomCode() {
+function generateRoomCode(len = CODE_LEN_PUBLIC) {
     const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
     for (let attempt = 0; attempt < 50; attempt++) {
         let code = '';
-        for (let i = 0; i < 4; i++) {
-            code += chars.charAt(Math.floor(Math.random() * chars.length));
+        for (let i = 0; i < len; i++) {
+            code += chars.charAt(crypto.randomInt(chars.length)); // aleatorio criptográfico: no predecible
         }
         if (!rooms.has(code)) return code; // evitar pisar una sala existente
     }
